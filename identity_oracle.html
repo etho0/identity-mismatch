@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Identity / Permission Mismatch Oracle</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f4f4f6;color:#111;padding:12px;font-size:14px}
+.card{background:#fff;border-radius:12px;padding:16px;max-width:640px;margin:0 auto 12px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+h2{font-size:16px;font-weight:650;margin-bottom:2px}
+h3{font-size:12px;font-weight:650;text-transform:uppercase;letter-spacing:.05em;color:#666;margin:14px 0 6px}
+.sub{font-size:11px;color:#777;line-height:1.5;margin-bottom:10px}
+.row{display:flex;gap:10px;font-size:12px;padding:4px 0;border-bottom:1px solid #f0f0f0;align-items:baseline}
+.row b{min-width:172px;color:#666;font-weight:500;flex-shrink:0}
+.row span{font-family:ui-monospace,monospace;word-break:break-all}
+.v-good{color:#1b7f3a}.v-warn{color:#a8620a}.v-bad{color:#c0202c;font-weight:600}
+.verdict{border-radius:10px;padding:12px;margin:10px 0;font-weight:650;text-align:center;line-height:1.45;font-size:13px}
+.q-none{background:#e8f5e9;color:#1b5e20}
+.q-some{background:#fff4e0;color:#8a5300}
+.q-bad{background:#fdecea;color:#b3001b}
+.q-wait{background:#eee;color:#777}
+button{width:100%;border:none;border-radius:8px;padding:10px;font-size:13px;font-weight:600;color:#fff;background:#2f6feb;margin-top:8px}
+button.danger{background:#c0202c}
+button.alt{background:#555}
+input{width:100%;border:1px solid #ddd;border-radius:8px;padding:8px;font-size:12px;font-family:ui-monospace,monospace;margin-bottom:8px}
+pre{background:#0d1117;color:#c9d1d9;border-radius:8px;padding:10px;font-size:10.5px;overflow:auto;max-height:280px;line-height:1.45}
+.d{border-left:3px solid #c0202c;background:#fff5f5;padding:8px 10px;margin:6px 0;font-size:12px;border-radius:0 6px 6px 0}
+.d b{color:#c0202c}
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h2>Identity / Permission Mismatch Oracle</h2>
+  <p class="sub">Authorized security research. Records what this context <b>claims to be</b>, what the
+  permission store <b>actually recorded</b>, and what the container <b>exposes</b> — then reports where
+  those disagree. <b>Passive by default:</b> nothing below triggers a permission prompt until you press
+  an ACTIVE button.</p>
+  <input id="srv" placeholder="capture server .../log  (optional)">
+  <div class="verdict q-wait" id="verdict">Collecting…</div>
+</div>
+
+<div class="card">
+  <h3>1 · Claimed identity — what the content thinks it is</h3><div id="s1"></div>
+  <h3>2 · Recorded permission state — what the store says</h3><div id="s2"></div>
+  <h3>3 · Container surface — what native bridge is reachable</h3><div id="s3"></div>
+  <h3>4 · Policy — what the platform allows here</h3><div id="s4"></div>
+  <h3>5 · Non-getUserMedia routes to capture</h3><div id="s5"></div>
+</div>
+
+<div class="card">
+  <h3>Divergences</h3>
+  <div id="divs"></div>
+</div>
+
+<div class="card">
+  <h3>Active tests — these MAY show a prompt</h3>
+  <p class="sub">Run these last. If a dialog appears, <b>record what name/origin it displays</b> —
+  that is the one value no API can report, and it is where misattribution findings come from.</p>
+  <button class="danger" onclick="activeGUM()">ACTIVE · getUserMedia (camera + mic)</button>
+  <button class="danger" onclick="activeGDM()">ACTIVE · getDisplayMedia (screen)</button>
+  <button class="alt" onclick="activeCapture()">ACTIVE · file input capture=camera</button>
+  <input id="promptName" placeholder="what did the prompt display? (type it here, then Save)">
+  <button class="alt" onclick="saveObservation()">Save observed prompt text</button>
+  <button onclick="copyJSON()" id="cbtn">Copy full fingerprint JSON</button>
+</div>
+
+<div class="card"><h3>Fingerprint</h3><pre id="json"></pre></div>
+<input type="file" accept="image/*" capture="environment" id="capin" style="display:none">
+
+<script>
+const Q = new URLSearchParams(location.search);
+const safeLS = k => { try { return localStorage.getItem(k); } catch(e){ return null; } };
+let SRV = Q.get('srv') || safeLS('oracle_srv') || '';
+document.getElementById('srv').value = SRV;
+document.getElementById('srv').onchange = e => {
+  SRV = e.target.value.replace(/\/$/,'');
+  try { localStorage.setItem('oracle_srv', SRV); } catch(e){}
+};
+
+const FP = { collected: new Date().toISOString(), claimed:{}, recorded:{}, container:{},
+             policy:{}, routes:{}, active:{}, observed:{}, divergences:[] };
+
+function row(sec, k, v, cls){
+  const d = document.createElement('div'); d.className = 'row';
+  const s = document.createElement('span'); s.textContent = String(v);
+  if (cls) s.className = cls;
+  const b = document.createElement('b'); b.textContent = k;
+  d.appendChild(b); d.appendChild(s);
+  document.getElementById(sec).appendChild(d);
+}
+function diverge(id, text){
+  FP.divergences.push({id, text});
+  const d = document.createElement('div'); d.className='d';
+  d.innerHTML = `<b>${id}</b> — ${text}`;
+  document.getElementById('divs').appendChild(d);
+}
+function render(){ document.getElementById('json').textContent = JSON.stringify(FP,null,2); }
+async function post(type, data){
+  if(!SRV) return;
+  try{ await fetch(SRV+'?type='+type,{method:'POST',
+    headers:{'Content-Type':'application/json','ngrok-skip-browser-warning':'true'},
+    body:JSON.stringify({...data,_ts:Date.now(),ua:navigator.userAgent,href:location.href})}); }catch(e){}
+}
+
+// ---------------------------------------------------------------- 1. claimed identity
+function collectClaimed(){
+  const c = FP.claimed;
+  c.origin       = location.origin;
+  c.href         = location.href.slice(0,300);
+  c.protocol     = location.protocol;
+  c.isOpaque     = location.origin === 'null';
+  c.isSecureContext = window.isSecureContext;
+  c.isTop        = (function(){ try { return window.top === window.self; } catch(e){ return 'cross-origin (blocked)'; } })();
+  try { c.ancestorOrigins = Array.from(location.ancestorOrigins || []); } catch(e){ c.ancestorOrigins = 'unavailable'; }
+  c.referrer     = document.referrer || '(none)';
+  c.hasOpener    = !!window.opener;
+  try { c.storageAccessible = (localStorage.getItem('x'), true); } catch(e){ c.storageAccessible = false; }
+
+  row('s1','origin', c.origin, c.isOpaque ? 'v-bad' : '');
+  row('s1','protocol', c.protocol, ['blob:','data:','file:'].includes(c.protocol) ? 'v-bad' : '');
+  row('s1','opaque origin', c.isOpaque, c.isOpaque ? 'v-bad':'v-good');
+  row('s1','secure context', c.isSecureContext, c.isSecureContext ? 'v-good':'v-bad');
+  row('s1','is top frame', c.isTop);
+  row('s1','ancestorOrigins', JSON.stringify(c.ancestorOrigins));
+  row('s1','referrer', c.referrer.slice(0,60));
+  row('s1','window.opener', c.hasOpener, c.hasOpener ? 'v-warn':'');
+  row('s1','storage accessible', c.storageAccessible, c.storageAccessible ? '' : 'v-warn');
+}
+
+// ---------------------------------------------------------------- 2. recorded state
+async function collectRecorded(){
+  const r = FP.recorded;
+  for (const n of ['camera','microphone','geolocation']) {
+    try { const p = await navigator.permissions.query({name:n}); r[n] = p.state; }
+    catch(e){ r[n] = 'query-unsupported'; }
+    row('s2', `permissions.query(${n})`, r[n], r[n]==='granted' ? 'v-bad' : r[n]==='prompt' ? 'v-warn' : '');
+  }
+  try {
+    const d = await navigator.mediaDevices.enumerateDevices();
+    r.deviceCount = d.length;
+    r.labelledCount = d.filter(x=>x.label).length;
+    r.labels = d.filter(x=>x.label).map(x=>`${x.kind}:${x.label}`).slice(0,6);
+  } catch(e){ r.deviceCount = 'error'; r.labelledCount = 0; r.labels = []; }
+  row('s2','devices', r.deviceCount);
+  row('s2','labelled devices', r.labelledCount, r.labelledCount>0 ? 'v-bad':'v-good');
+  if (r.labels && r.labels.length) row('s2','labels', r.labels.join(', ').slice(0,90),'v-bad');
+}
+
+// ---------------------------------------------------------------- 3. container surface
+function collectContainer(){
+  const c = FP.container;
+  const probes = {
+    'ReactNativeWebView' : () => typeof window.ReactNativeWebView !== 'undefined',
+    'vkBridge / VK'      : () => typeof window.vkBridge !== 'undefined' || typeof window.AndroidBridge !== 'undefined',
+    'TelegramWebview'    : () => typeof window.TelegramWebviewProxy !== 'undefined' || typeof window.Telegram !== 'undefined',
+    'webkit.messageHandlers': () => !!(window.webkit && window.webkit.messageHandlers),
+    'chrome.webview (WV2)': () => !!(window.chrome && window.chrome.webview),
+    'Electron require'   : () => typeof window.require === 'function',
+    'Electron process'   : () => typeof window.process !== 'undefined' && !!(window.process && window.process.versions),
+    'Android JS iface'   : () => Object.keys(window).some(k => /^(Android|JSBridge|NativeBridge|jsi_)/i.test(k)),
+  };
+  c.bridges = [];
+  for (const [name, fn] of Object.entries(probes)) {
+    let present = false; try { present = !!fn(); } catch(e){}
+    if (present) c.bridges.push(name);
+    row('s3', name, present, present ? 'v-bad' : 'v-good');
+  }
+  c.anyBridge = c.bridges.length > 0;
+  if (window.process && window.process.versions) c.electronVersions = window.process.versions;
+}
+
+// ---------------------------------------------------------------- 4. policy
+function collectPolicy(){
+  const p = FP.policy;
+  const fp = document.featurePolicy || document.permissionsPolicy;
+  p.apiAvailable = !!(fp && fp.allowsFeature);
+  if (p.apiAvailable) {
+    for (const f of ['camera','microphone','display-capture','geolocation']) {
+      try { p[f] = fp.allowsFeature(f); } catch(e){ p[f] = 'error'; }
+      row('s4', `allowsFeature(${f})`, p[f], p[f]===true ? 'v-warn' : 'v-good');
+    }
+    try { p.allowedFeatures = fp.allowedFeatures().slice(0,25); } catch(e){}
+  } else row('s4','featurePolicy API','unavailable','v-warn');
+}
+
+// ---------------------------------------------------------------- 5. non-gUM routes
+function collectRoutes(){
+  const r = FP.routes;
+  const inp = document.createElement('input'); inp.type='file';
+  r.fileCaptureSupported = 'capture' in inp;
+  r.getDisplayMedia      = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+  r.speechRecognition    = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+  r.imageCapture         = typeof window.ImageCapture !== 'undefined';
+  r.legacyGetUserMedia   = !!(navigator.getUserMedia || navigator.webkitGetUserMedia || navigator.mozGetUserMedia);
+  row('s5','input capture= attr', r.fileCaptureSupported, r.fileCaptureSupported ? 'v-warn':'');
+  row('s5','getDisplayMedia', r.getDisplayMedia, r.getDisplayMedia ? 'v-warn':'');
+  row('s5','SpeechRecognition (mic)', r.speechRecognition, r.speechRecognition ? 'v-warn':'');
+  row('s5','ImageCapture', r.imageCapture);
+  row('s5','legacy getUserMedia', r.legacyGetUserMedia, r.legacyGetUserMedia ? 'v-warn':'');
+}
+
+// ---------------------------------------------------------------- divergence analysis
+function analyse(){
+  const {claimed:c, recorded:r, container:k, policy:p} = FP;
+
+  // D1 — cross-origin frame that can still reach camera => delegation by the embedder
+  const crossOrigin = Array.isArray(c.ancestorOrigins) && c.ancestorOrigins.length > 0
+                      && c.ancestorOrigins[0] !== c.origin;
+  if (crossOrigin && p.camera === true)
+    diverge('D1 · delegated',
+      `This frame (<code>${c.origin}</code>) is cross-origin under <code>${c.ancestorOrigins[0]}</code>, yet camera is ALLOWED here. The embedder delegated its permission to third-party content. Any grant will be recorded against the embedder, not against this origin.`);
+
+  // D2 — store says not-granted but labels are exposed => the two disagree
+  if (r.labelledCount > 0 && r.camera !== 'granted')
+    diverge('D2 · store mismatch',
+      `Device labels are exposed (${r.labelledCount}) while permissions.query(camera) reports "<b>${r.camera}</b>". Labels are supposed to appear only once granted — the permission store and the device layer disagree about this context.`);
+
+  // D3 — policy vs query disagreement
+  if (p.camera === true && r.camera === 'denied')
+    diverge('D3 · policy/query split',
+      `Permissions-Policy allows camera here, but permissions.query reports "denied" — something below the policy layer is refusing. Identify which, it decides exploitability.`);
+  if (p.camera === false && r.camera === 'granted')
+    diverge('D3b · policy/query split',
+      `Policy says camera is NOT allowed here, yet the store reports "granted". A grant exists that the policy should be suppressing.`);
+
+  // D4 — opaque origin with a native bridge => container gave native reach to unattributable content
+  if (c.isOpaque && k.anyBridge)
+    diverge('D4 · opaque + bridge',
+      `Origin is opaque (<code>null</code>) yet a native bridge is reachable: ${k.bridges.join(', ')}. Content with no attributable origin can call native code — no permission decision about it can be correctly scoped or displayed.`);
+
+  // D5 — bridge present and camera already granted => container-mediated inheritance
+  if (k.anyBridge && (r.camera === 'granted' || r.labelledCount > 0))
+    diverge('D5 · container inheritance',
+      `A native bridge is present (${k.bridges.join(', ')}) AND camera appears available without this origin having asked. Classic container-level inheritance — run the ACTIVE test and time it: a grant under 400ms means no dialog was possible.`);
+
+  // D6 — insecure context that still reaches media
+  if (!c.isSecureContext && (p.camera === true || r.camera === 'granted'))
+    diverge('D6 · insecure context',
+      `Not a secure context, yet camera is reachable. Secure-context gating is being bypassed by the container.`);
+
+  // D7 — non-http(s) scheme with media reach
+  if (['blob:','data:','file:'].includes(c.protocol) && (p.camera === true || r.camera === 'granted'))
+    diverge('D7 · exotic scheme',
+      `Scheme is <code>${c.protocol}</code> and camera is reachable. Origin assignment for this scheme is unspecified — prime origin-confusion territory (the Pickren class).`);
+
+  // D8 — opener relationship, the window.open inheritance class
+  if (c.hasOpener && (p.camera === true || r.camera === 'granted'))
+    diverge('D8 · opener inheritance',
+      `window.opener is set and camera is reachable — matches the Chromium 424995167 class (popup inherits the opener's permission context).`);
+
+  const n = FP.divergences.length;
+  const v = document.getElementById('verdict');
+  if (n === 0) { v.className='verdict q-none'; v.textContent = 'No identity/permission divergence detected in this context.'; }
+  else if (n <= 2) { v.className='verdict q-some'; v.textContent = `${n} divergence(s) — worth an ACTIVE test.`; }
+  else { v.className='verdict q-bad'; v.textContent = `${n} DIVERGENCES — this context is a strong candidate.`; }
+}
+
+// ---------------------------------------------------------------- active tests
+async function activeGUM(){
+  const t0 = Date.now();
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({video:true, audio:true});
+    const ms = Date.now()-t0;
+    FP.active.gUM = { granted:true, elapsed_ms:ms,
+      videoLabels:s.getVideoTracks().map(t=>t.label), audioLabels:s.getAudioTracks().map(t=>t.label),
+      interpretation: ms < 400 ? 'SILENT — no dialog possible at this speed' : 'a dialog was likely shown' };
+    if (ms < 400) diverge('A1 · SILENT GRANT', `getUserMedia granted in <b>${ms}ms</b>. No dialog is displayable, readable and acceptable in that time. This is the finding.`);
+    s.getTracks().forEach(t=>t.stop());
+  } catch(e){
+    FP.active.gUM = { granted:false, elapsed_ms:Date.now()-t0, error:e.name, message:e.message };
+  }
+  render(); post('ORACLE_ACTIVE_GUM', FP.active.gUM);
+  alert('gUM: ' + JSON.stringify(FP.active.gUM.interpretation || FP.active.gUM.error));
+}
+async function activeGDM(){
+  const t0 = Date.now();
+  try {
+    const s = await navigator.mediaDevices.getDisplayMedia({video:true});
+    FP.active.gDM = { granted:true, elapsed_ms:Date.now()-t0, label:s.getVideoTracks()[0]?.label };
+    s.getTracks().forEach(t=>t.stop());
+  } catch(e){ FP.active.gDM = { granted:false, elapsed_ms:Date.now()-t0, error:e.name, message:e.message }; }
+  render(); post('ORACLE_ACTIVE_GDM', FP.active.gDM);
+}
+function activeCapture(){
+  // The non-gUM route: does the native camera open with no permission prompt at all?
+  const el = document.getElementById('capin');
+  const t0 = Date.now();
+  let fired = false;
+  el.onchange = () => { fired = true;
+    FP.active.fileCapture = { opened:true, elapsed_ms:Date.now()-t0, gotFile:!!el.files.length };
+    render(); post('ORACLE_ACTIVE_CAPTURE', FP.active.fileCapture); };
+  el.click();
+  setTimeout(()=>{ if(!fired){ FP.active.fileCapture = { opened:'unknown — no change event', note:'watch the screen: did the camera UI appear?' }; render(); } }, 4000);
+}
+function saveObservation(){
+  FP.observed.promptText = document.getElementById('promptName').value;
+  FP.observed.note = 'Human-observed prompt content — no API can report this.';
+  render(); post('ORACLE_OBSERVED', FP.observed);
+  alert('saved');
+}
+function copyJSON(){
+  const b = document.getElementById('cbtn');
+  navigator.clipboard?.writeText(JSON.stringify(FP,null,2))
+    .then(()=>{b.textContent='Copied!'; setTimeout(()=>b.textContent='Copy full fingerprint JSON',1500);})
+    .catch(()=>{b.textContent='Copy failed — select the JSON below';});
+}
+
+// ---------------------------------------------------------------- run (passive only)
+(async () => {
+  collectClaimed();
+  await collectRecorded();
+  collectContainer();
+  collectPolicy();
+  collectRoutes();
+  analyse();
+  render();
+  post('ORACLE_FINGERPRINT', FP);
+})();
+</script>
+</body>
+</html>
