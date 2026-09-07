@@ -43,8 +43,14 @@ input{width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;borde
 const ORIGIN = location.origin;
 document.getElementById('org').textContent = ORIGIN;
 const CANARY_KEY = 'oc_canary';
-const CANARY = 'CANARY-' + ORIGIN + '-' + Date.now();
-try { localStorage.setItem(CANARY_KEY, CANARY); } catch(e) {}
+// Idempotent: reuse an existing canary if present. The CONTROL iframe loads this
+// same page, so minting a fresh value here would overwrite the parent's and make
+// every legitimate same-origin read compare against a stale string.
+let CANARY = null;
+try {
+  CANARY = localStorage.getItem(CANARY_KEY);
+  if (!CANARY) { CANARY = 'CANARY-' + ORIGIN + '-' + Date.now(); localStorage.setItem(CANARY_KEY, CANARY); }
+} catch(e) { CANARY = 'CANARY-unavailable'; }
 
 const Q = new URLSearchParams(location.search);
 let SRV = Q.get('srv') || (()=>{try{return localStorage.getItem('oracle_srv')}catch(e){return null}})() || '';
@@ -66,7 +72,7 @@ function finish(d, {read, detail, expectRead}){
   const unexpected = (expectRead !== null) && (leaked !== expectRead);
   d.className = 't ' + (unexpected ? 'fail' : 'expected');
   res.className = 'res ' + (unexpected ? 'r-leak' : leaked ? 'r-info' : 'r-safe');
-  res.textContent = (leaked ? 'CANARY READ — context IS this origin' : 'no read')
+  res.textContent = (leaked ? (d.dataset.mode === 'flag' ? 'FLAGGED' : 'CANARY READ — context IS this origin') : (d.dataset.mode === 'flag' ? 'not flagged' : 'no read'))
                   + (detail ? '  ·  ' + detail : '')
                   + (expectRead === null ? '  ·  (informational)'
                      : unexpected ? '  ·  *** DIVERGES FROM SPEC — INVESTIGATE ***'
@@ -223,16 +229,25 @@ async function runAll(){
   // ---- T7: opaque origin + secure context — the CVE-2020-3865 check
   {
     const d = card('T7 · is an opaque origin treated as a SECURE CONTEXT?',
-      'Safari wrongly treated opaque origins as secure, which re-enabled the mediaDevices API inside a sandbox. Any "true" here is directly the CVE-2020-3865 class.');
+      'Safari wrongly treated opaque origins as secure when the delivery chain was NOT secure, re-enabling mediaDevices inside a sandbox (CVE-2020-3865). Over https this reporting true is correct.');
+    d.dataset.mode = 'flag';
     const f=document.createElement('iframe'); f.style.display='none';
     f.setAttribute('sandbox','allow-scripts');
     f.srcdoc = `<script>parent.postMessage({__oc:true,out:{read:false,origin:'sandboxed',
       secure: window.isSecureContext, hasMedia: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)}},'*')<\/script>`;
     document.body.appendChild(f);
     const out = await waitMsg();
-    const bad = !!(out && out.secure && out.hasMedia);
+    // Secure context depends on the DELIVERY CHAIN, not the origin: an opaque-origin
+    // document inside an https page is correctly a secure context. CVE-2020-3865 was
+    // Safari marking opaque origins secure when the chain was NOT secure. So this is
+    // only a violation when the page itself was not delivered securely.
+    const insecureChain = location.protocol !== 'https:' && location.hostname !== 'localhost';
+    const bad = !!(out && out.secure && out.hasMedia && insecureChain);
     finish(d, {read: bad,
-               detail: out ? `isSecureContext=${out.secure} mediaDevices=${out.hasMedia}` : 'no response',
+               detail: out ? `isSecureContext=${out.secure} mediaDevices=${out.hasMedia} `
+                             + `pageScheme=${location.protocol} `
+                             + (insecureChain ? '(INSECURE CHAIN — violation)' : '(secure chain — expected)')
+                           : 'no response',
                expectRead:false});
     f.remove();
   }
