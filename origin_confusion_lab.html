@@ -159,7 +159,7 @@ async function runAll(){
   // ---- T3: blob: iframe — blob inherits the creating origin by spec
   {
     const d = card('T3 · blob: URL iframe',
-      'blob: inherits the creating origin per spec, so a read is expected here. The interesting part is whether the origin STRING is well-formed — Pickren\\'s chain began with a malformed blob origin.');
+      'blob: inherits the creating origin per spec, so a read is expected here. The interesting part is whether the origin STRING is well-formed — the Pickren chain began with a malformed blob origin.');
     let url=null, detail='';
     try { url = URL.createObjectURL(new Blob([probeSrc()], {type:'text/html'})); } catch(e){ detail='blob create failed: '+e.name; }
     let read=false;
