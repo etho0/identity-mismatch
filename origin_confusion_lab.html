@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Origin Confusion Lab — localStorage oracle</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#c9d1d9;padding:14px;font-size:14px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:16px;max-width:720px;margin:0 auto 12px}
+h2{font-size:16px;color:#58a6ff;margin-bottom:4px}
+.sub{font-size:11px;color:#8b949e;line-height:1.55;margin-bottom:10px}
+button{width:100%;border:none;border-radius:8px;padding:10px;font-size:13px;font-weight:600;color:#fff;background:#1f6feb;margin-top:8px}
+.t{border:1px solid #21262d;border-radius:8px;padding:9px 11px;margin:7px 0;font-size:12px}
+.t .name{font-weight:650;color:#c9d1d9;margin-bottom:3px}
+.t .why{color:#8b949e;font-size:11px;line-height:1.45;margin-bottom:5px}
+.t .res{font-family:ui-monospace,monospace;font-size:11.5px}
+.pass{border-left:3px solid #3fb950}.fail{border-left:3px solid #f85149}.expected{border-left:3px solid #30363d}
+.r-safe{color:#7ee787}.r-leak{color:#ff7b72;font-weight:700}.r-info{color:#e3b341}
+.verdict{border-radius:8px;padding:12px;margin:10px 0;font-weight:650;text-align:center;font-size:13px;line-height:1.5}
+.v-ok{background:#0f5323;color:#7ee787}.v-bad{background:#2d1214;color:#ff7b72}.v-wait{background:#21262d;color:#8b949e}
+code{background:#21262d;padding:1px 5px;border-radius:4px;font-size:.85em}
+input{width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:8px;padding:8px;font-size:12px;font-family:ui-monospace,monospace;margin-bottom:8px}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Origin Confusion Lab</h2>
+  <p class="sub">
+  <b>Oracle:</b> <code>localStorage</code> is strictly origin-partitioned and has no permission layer.
+  This page writes a canary as <code id="org"></code>. Each technique below then tries to read that
+  canary from a context that <i>should not</i> be this origin. <b>A successful read proves the browser
+  considers that context to BE this origin</b> — origin confusion, with no prompt and no hardware involved.
+  <br><br>Safe by design: nothing here touches camera, mic or any permission. Escalation to
+  <code>getUserMedia</code> is only meaningful <i>after</i> a read succeeds.</p>
+  <input id="srv" placeholder="oracle server .../log (optional)">
+  <div class="verdict v-wait" id="verdict">idle</div>
+  <button onclick="runAll()">Run all origin-confusion techniques</button>
+  <div id="out"></div>
+</div>
+
+<script>
+const ORIGIN = location.origin;
+document.getElementById('org').textContent = ORIGIN;
+const CANARY_KEY = 'oc_canary';
+const CANARY = 'CANARY-' + ORIGIN + '-' + Date.now();
+try { localStorage.setItem(CANARY_KEY, CANARY); } catch(e) {}
+
+const Q = new URLSearchParams(location.search);
+let SRV = Q.get('srv') || (()=>{try{return localStorage.getItem('oracle_srv')}catch(e){return null}})() || '';
+document.getElementById('srv').value = SRV;
+document.getElementById('srv').onchange = e => { SRV = e.target.value.replace(/\/$/,'');
+  try{ localStorage.setItem('oracle_srv', SRV);}catch(_){} };
+
+const R = { origin: ORIGIN, ua: navigator.userAgent, results: [] };
+
+function card(name, why){
+  const d = document.createElement('div'); d.className='t expected';
+  d.innerHTML = `<div class="name">${name}</div><div class="why">${why}</div><div class="res r-info">running…</div>`;
+  document.getElementById('out').appendChild(d); return d;
+}
+function finish(d, {read, detail, expectRead}){
+  const res = d.querySelector('.res');
+  const leaked = read === true;
+  // "expectRead" = the spec-correct answer. Divergence from it is the finding.
+  const unexpected = (expectRead !== null) && (leaked !== expectRead);
+  d.className = 't ' + (unexpected ? 'fail' : 'expected');
+  res.className = 'res ' + (unexpected ? 'r-leak' : leaked ? 'r-info' : 'r-safe');
+  res.textContent = (leaked ? 'CANARY READ — context IS this origin' : 'no read')
+                  + (detail ? '  ·  ' + detail : '')
+                  + (expectRead === null ? '  ·  (informational)'
+                     : unexpected ? '  ·  *** DIVERGES FROM SPEC — INVESTIGATE ***'
+                     : '  ·  matches spec');
+  R.results.push({name: d.querySelector('.name').textContent, read: leaked, detail, expectRead, unexpected});
+}
+
+// helper: run a snippet inside a frame/window and get back whether it could read the canary
+function probeSrc(){
+  return `<script>
+    (function(){
+      var out = {read:false, origin:null, err:null};
+      try { out.origin = location.origin; } catch(e){}
+      try { out.read = (localStorage.getItem(${JSON.stringify(CANARY_KEY)}) === ${JSON.stringify(CANARY)}); }
+      catch(e){ out.err = e.name; }
+      try { parent.postMessage({__oc:true, out:out}, '*'); } catch(e){}
+      try { if (window.opener) opener.postMessage({__oc:true, out:out}, '*'); } catch(e){}
+    })();
+  <\/script>`;
+}
+function waitMsg(timeout=2500){
+  return new Promise(res=>{
+    const t = setTimeout(()=>{ window.removeEventListener('message', h); res(null); }, timeout);
+    function h(ev){ if(ev.data && ev.data.__oc){ clearTimeout(t); window.removeEventListener('message', h); res(ev.data.out); } }
+    window.addEventListener('message', h);
+  });
+}
+
+async function runAll(){
+  document.getElementById('out').innerHTML=''; R.results=[];
+
+  // ---- CONTROL 1: same-origin iframe. MUST read. Validates the harness.
+  {
+    const d = card('CONTROL · same-origin iframe',
+      'Must succeed. If this fails the harness is broken and every other result is meaningless.');
+    const f = document.createElement('iframe'); f.style.display='none';
+    f.src = location.pathname + '?child=1';
+    document.body.appendChild(f);
+    // simpler: read directly through the same-origin contentWindow
+    await new Promise(r=>{ f.onload=r; setTimeout(r,1500); });
+    let read=false, detail='';
+    try { read = f.contentWindow.localStorage.getItem(CANARY_KEY) === CANARY; detail='via contentWindow'; }
+    catch(e){ detail = 'blocked: '+e.name; }
+    finish(d, {read, detail, expectRead:true});
+    f.remove();
+  }
+
+  // ---- CONTROL 2: about:blank iframe — SPEC says it inherits the embedder's origin.
+  {
+    const d = card('CONTROL · about:blank iframe (inherits by spec)',
+      'about:blank inherits the embedder origin, so a read here is CORRECT behaviour — a second harness check.');
+    const f = document.createElement('iframe'); f.style.display='none'; f.src='about:blank';
+    document.body.appendChild(f);
+    await new Promise(r=>setTimeout(r,300));
+    let read=false, detail='';
+    try { f.contentDocument.write(probeSrc()); f.contentDocument.close(); } catch(e){ detail='write blocked: '+e.name; }
+    const out = await waitMsg();
+    if (out){ read = out.read; detail = 'origin='+out.origin+(out.err?' err='+out.err:''); }
+    finish(d, {read, detail, expectRead:true});
+    f.remove();
+  }
+
+  // ---- T1: srcdoc iframe — inherits embedder origin by spec
+  {
+    const d = card('T1 · iframe srcdoc',
+      'srcdoc inherits the embedder origin per spec, so a read is expected. Watch instead for a WRONG origin string.');
+    const f = document.createElement('iframe'); f.style.display='none';
+    f.srcdoc = probeSrc(); document.body.appendChild(f);
+    const out = await waitMsg();
+    finish(d, {read: out ? out.read : false,
+               detail: out ? 'origin='+out.origin+(out.err?' err='+out.err:'') : 'no response',
+               expectRead:true});
+    f.remove();
+  }
+
+  // ---- T2: sandboxed srcdoc WITHOUT allow-same-origin — must be opaque, must NOT read
+  {
+    const d = card('T2 · sandboxed srcdoc (no allow-same-origin)',
+      'Sandbox without allow-same-origin gives an opaque origin. A read here would be a serious origin-confusion bug.');
+    const f = document.createElement('iframe'); f.style.display='none';
+    f.setAttribute('sandbox','allow-scripts');
+    f.srcdoc = probeSrc(); document.body.appendChild(f);
+    const out = await waitMsg();
+    finish(d, {read: out ? out.read : false,
+               detail: out ? 'origin='+out.origin+(out.err?' err='+out.err:'') : 'no response (script may be blocked)',
+               expectRead:false});
+    f.remove();
+  }
+
+  // ---- T3: blob: iframe — blob inherits the creating origin by spec
+  {
+    const d = card('T3 · blob: URL iframe',
+      'blob: inherits the creating origin per spec, so a read is expected here. The interesting part is whether the origin STRING is well-formed — Pickren\\'s chain began with a malformed blob origin.');
+    let url=null, detail='';
+    try { url = URL.createObjectURL(new Blob([probeSrc()], {type:'text/html'})); } catch(e){ detail='blob create failed: '+e.name; }
+    let read=false;
+    if (url){
+      const f=document.createElement('iframe'); f.style.display='none'; f.src=url; document.body.appendChild(f);
+      const out = await waitMsg();
+      if (out){ read=out.read; detail='origin='+out.origin+(out.err?' err='+out.err:''); }
+      f.remove(); URL.revokeObjectURL(url);
+    }
+    finish(d, {read, detail, expectRead:true});
+  }
+
+  // ---- T4: data: iframe — MUST be opaque, MUST NOT read
+  {
+    const d = card('T4 · data: URL iframe',
+      'data: documents get an opaque origin. A read here means data: inherits the embedder — the CVE-2020-3864 family.');
+    const f=document.createElement('iframe'); f.style.display='none';
+    f.src = 'data:text/html;charset=utf-8,' + encodeURIComponent('<html>'+probeSrc()+'</html>');
+    document.body.appendChild(f);
+    const out = await waitMsg();
+    finish(d, {read: out ? out.read : false,
+               detail: out ? 'origin='+out.origin+(out.err?' err='+out.err:'') : 'no response (opaque, as expected)',
+               expectRead:false});
+    f.remove();
+  }
+
+  // ---- T5: history.pushState origin forging — location must not become another origin
+  {
+    const d = card('T5 · history.pushState cross-origin path',
+      'Pickren forged location via two individually-legal pushState calls. Any accepted call that changes the ORIGIN (not just the path) is the bug.');
+    const before = location.origin, beforeHref = location.href;
+    let detail='', changed=false;
+    try {
+      history.pushState('','', '/oc-probe-' + Date.now());
+      const midOrigin = location.origin;
+      try { history.pushState('','', 'https://example.com/'); } catch(e){ detail='2nd pushState threw '+e.name+' (correct)'; }
+      changed = (location.origin !== before);
+      detail = (detail? detail+' · ':'') + 'origin '+before+' -> '+location.origin;
+      history.replaceState('','', beforeHref);
+    } catch(e){ detail = 'threw '+e.name+' (correct)'; }
+    finish(d, {read: changed, detail, expectRead:false});
+  }
+
+  // ---- T6: javascript: URL in an iframe — must not execute in the parent origin from a cross-doc nav
+  {
+    const d = card('T6 · javascript: URL iframe',
+      'A javascript: URL navigating a frame should not grant the parent origin to unrelated content. Informational on most browsers.');
+    let read=false, detail='';
+    try {
+      const f=document.createElement('iframe'); f.style.display='none';
+      f.src = 'javascript:"<html>' + '"';
+      document.body.appendChild(f);
+      await new Promise(r=>setTimeout(r,400));
+      try { read = f.contentWindow.localStorage.getItem(CANARY_KEY) === CANARY; detail='same-origin access allowed'; }
+      catch(e){ detail = 'blocked: '+e.name; }
+      f.remove();
+    } catch(e){ detail = 'threw '+e.name; }
+    finish(d, {read, detail, expectRead:null});
+  }
+
+  // ---- T7: opaque origin + secure context — the CVE-2020-3865 check
+  {
+    const d = card('T7 · is an opaque origin treated as a SECURE CONTEXT?',
+      'Safari wrongly treated opaque origins as secure, which re-enabled the mediaDevices API inside a sandbox. Any "true" here is directly the CVE-2020-3865 class.');
+    const f=document.createElement('iframe'); f.style.display='none';
+    f.setAttribute('sandbox','allow-scripts');
+    f.srcdoc = `<script>parent.postMessage({__oc:true,out:{read:false,origin:'sandboxed',
+      secure: window.isSecureContext, hasMedia: !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia)}},'*')<\/script>`;
+    document.body.appendChild(f);
+    const out = await waitMsg();
+    const bad = !!(out && out.secure && out.hasMedia);
+    finish(d, {read: bad,
+               detail: out ? `isSecureContext=${out.secure} mediaDevices=${out.hasMedia}` : 'no response',
+               expectRead:false});
+    f.remove();
+  }
+
+  // ---- verdict
+  const diverged = R.results.filter(x=>x.unexpected);
+  const ctrlOK = R.results.filter(x=>/^CONTROL/.test(x.name)).every(x=>x.read===true);
+  const v=document.getElementById('verdict');
+  if(!ctrlOK){ v.className='verdict v-bad';
+    v.textContent='CONTROLS FAILED — the harness is not working in this context; ignore all other rows.'; }
+  else if(diverged.length===0){ v.className='verdict v-ok';
+    v.textContent='All techniques behaved per spec. No origin confusion in this browser/container.'; }
+  else { v.className='verdict v-bad';
+    v.innerHTML = `${diverged.length} DIVERGENCE(S) FROM SPEC:<br>` + diverged.map(x=>x.name).join('<br>')
+      + `<br><br>If a canary read succeeded where it should not have, the browser believes that context is <code>${ORIGIN}</code>. Escalate: from that context request getUserMedia and see whether it inherits this origin's grant.`; }
+
+  R.controlsOK = ctrlOK; R.divergences = diverged.length;
+  if (SRV) { try { await fetch(SRV+'?type=ORIGIN_CONFUSION',{method:'POST',
+    headers:{'Content-Type':'application/json','ngrok-skip-browser-warning':'true'},
+    body:JSON.stringify(R)}); } catch(e){} }
+}
+</script>
+</body>
+</html>

@@ -11,5 +11,8 @@ and <em>platform policy</em> disagree with each other.</p>
 <p><a href="stream_holder.html">stream_holder.html</a> / <a href="stream_prober.html">stream_prober.html</a>
  — cross-origin media-state experiment: one page holds a live camera or screen capture, the other
  probes what a second origin can learn about or take from it.</p>
+<p><a href="origin_confusion_lab.html">origin_confusion_lab.html</a> — origin-confusion test lab.
+Uses <code>localStorage</code> as an origin oracle: a successful canary read from a context that should
+not be this origin proves the browser considers it to BE this origin. No permissions, no hardware.</p>
 <p>Passive by default; media tests are opt-in. Append
 <code>?srv=https://your-server/log</code> to post the fingerprint to your own receiver.</p>
