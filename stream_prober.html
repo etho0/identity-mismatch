@@ -29,7 +29,9 @@ code{background:#21262d;padding:2px 5px;border-radius:4px;font-size:.85em}
   <p class="sub">Run in a <b>second tab</b> (ideally a <b>different origin</b>) while the holder page
   keeps a stream live. Tests what B can learn about — or take from — A's active capture.
   <br><br>This origin: <code id="org"></code></p>
+  <input id="holder" placeholder="holder (Origin A) URL — e.g. https://etho0.github.io/identity-mismatch/stream_holder.html">
   <input id="srv" placeholder="oracle server .../log (optional)">
+  <div class="verdict v-wait" id="sameorigin">enter the holder URL to check origin separation</div>
   <div class="verdict v-wait" id="verdict">idle</div>
   <button onclick="runAll()">Run full probe battery</button>
   <button class="alt" onclick="watchDeviceChange()">Watch devicechange events (30s)</button>
@@ -45,18 +47,39 @@ document.getElementById('srv').onchange = e => { SRV = e.target.value.replace(/\
   try{ localStorage.setItem('oracle_srv', SRV); }catch(_){} };
 
 const R = { origin: location.origin, probes: {}, leaks: [] };
+let SAME_ORIGIN = null;   // null = unknown, true = invalid test, false = valid cross-origin test
+function checkOrigins(){
+  const h = document.getElementById('holder').value.trim();
+  const el = document.getElementById('sameorigin');
+  if (!h) { SAME_ORIGIN = null; el.className='verdict v-wait';
+    el.textContent='enter the holder URL to check origin separation'; return; }
+  let ho; try { ho = new URL(h).origin; } catch(e){ el.textContent='unparseable URL'; return; }
+  SAME_ORIGIN = (ho === location.origin);
+  R.holderOrigin = ho; R.sameOrigin = SAME_ORIGIN;
+  if (SAME_ORIGIN) { el.className='verdict v-leak';
+    el.innerHTML = `SAME ORIGIN (${ho}) — this is NOT a cross-origin test.<br>`
+      + `Everything below is expected behaviour, not a finding. Serve the prober from a different HOST.<br>`
+      + `<b>Note: all GitHub Pages project sites share one host</b>, so a different repo is still the same origin.`; }
+  else { el.className='verdict v-none';
+    el.textContent = `cross-origin OK — A=${ho}  B=${location.origin}`; }
+}
+document.getElementById('holder').onchange = checkOrigins;
 function sec(t){ const h=document.createElement('h3'); h.textContent=t; document.getElementById('out').appendChild(h); }
 function row(k,v,cls){ const d=document.createElement('div'); d.className='row';
   const b=document.createElement('b'); b.textContent=k;
   const s=document.createElement('span'); s.textContent=String(v); if(cls) s.className=cls;
   d.appendChild(b); d.appendChild(s); document.getElementById('out').appendChild(d); }
-function leak(id, text){ R.leaks.push({id,text}); }
+function leak(id, text){
+  if (SAME_ORIGIN === true) { R.leaks.push({id, text, suppressed:'same-origin — expected behaviour, not a finding'}); return; }
+  R.leaks.push({id,text});
+}
 async function post(type,data){ if(!SRV) return;
   try{ await fetch(SRV+'?type='+type,{method:'POST',
     headers:{'Content-Type':'application/json','ngrok-skip-browser-warning':'true'},
     body:JSON.stringify({...data,_ts:Date.now(),ua:navigator.userAgent,href:location.href})});}catch(e){} }
 
 async function runAll(){
+  checkOrigins();
   document.getElementById('out').innerHTML='';
   R.probes = {}; R.leaks = [];
 
@@ -132,9 +155,17 @@ async function runAll(){
   row('getDisplayMedia present', R.probes.getDisplayMedia, R.probes.getDisplayMedia?'warn':'safe');
 
   const v=document.getElementById('verdict');
-  if (R.leaks.length===0){ v.className='verdict v-none'; v.textContent='No cross-origin leakage detected from B.'; }
+  const real = R.leaks.filter(l=>!l.suppressed);
+  if (SAME_ORIGIN === true){ v.className='verdict v-wait';
+    v.innerHTML = `SAME-ORIGIN RUN — ${R.leaks.length} result(s), <b>none are findings</b>.<br>`
+      + `A and B share an origin, so shared permission, labels and storage are by design.<br>`
+      + `Re-run with the prober on a different host.`; }
+  else if (SAME_ORIGIN === null){ v.className='verdict v-wait';
+    v.innerHTML = `${R.leaks.length} result(s) — <b>origin separation UNVERIFIED</b>.<br>`
+      + `Enter the holder URL above so these can be interpreted.`; }
+  else if (real.length===0){ v.className='verdict v-none'; v.textContent='No cross-origin leakage detected from B.'; }
   else { v.className='verdict v-leak';
-    v.innerHTML = `${R.leaks.length} LEAK(S):<br>` + R.leaks.map(l=>`${l.id} — ${l.text}`).join('<br>'); }
+    v.innerHTML = `${real.length} CROSS-ORIGIN LEAK(S):<br>` + real.map(l=>`${l.id} — ${l.text}`).join('<br>'); }
   post('STREAM_PROBE', R);
 }
 
